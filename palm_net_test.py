@@ -1,4 +1,5 @@
 import os
+import math
 import argparse
 import numpy as np
 import onnxruntime as ort
@@ -7,7 +8,6 @@ from itertools import combinations
 
 """
 Ruslan you can use a threshold like 0.45/0.5 and it should work correctly for matching.
-
 """
 
 def load_bbox(directory: str) -> dict:
@@ -32,10 +32,14 @@ def load_skeleton(directory: str) -> list[tuple[float, float]]:
     return [(vals[i * 2], vals[i * 2 + 1]) for i in range(5)]
 
 
-def is_upside_down(kps: list[tuple[float, float]]) -> bool:
-    """Palm is upside-down when wrist (kp4) is above the finger bases (kp0–kp3) in image coords."""
-    finger_y = np.mean([kps[i][1] for i in range(4)])
-    return kps[4][1] < finger_y
+def canonical_angle(kps: list[tuple[float, float]]) -> float:
+    """CCW degrees to rotate so fingers always point up, wrist down."""
+    finger_cx = np.mean([kps[i][0] for i in range(4)])
+    finger_cy = np.mean([kps[i][1] for i in range(4)])
+    wrist_x, wrist_y = kps[4]
+    dx = finger_cx - wrist_x
+    dy = finger_cy - wrist_y
+    return np.degrees(np.arctan2(dx, -dy))  # 0° when fingers directly above wrist
 
 
 def load_crop_array(directory: str) -> np.ndarray:
@@ -58,31 +62,38 @@ def load_crop_array(directory: str) -> np.ndarray:
     cx = (np.mean(finger_xs) + wrist_x) / 2.0
     cy = (np.mean(finger_ys) + wrist_y) / 2.0
 
-    palm_h = abs(wrist_y - np.mean(finger_ys))
-    palm_w = max(finger_xs) - min(finger_xs)
-    side = int(max(palm_h, palm_w) * 1.15)
+    # Use Euclidean wrist→finger-centroid distance so the crop is correct
+    # for any palm orientation (image-coordinate projections underestimate
+    # the true palm length when the palm is rotated).
+    finger_cx = np.mean(finger_xs)
+    finger_cy = np.mean(finger_ys)
+    palm_len  = np.hypot(finger_cx - wrist_x, finger_cy - wrist_y)
+    side      = int(palm_len * 1.4)  # 1.4 leaves room for fingertips above centroid
 
-    x1, y1 = int(cx - side / 2), int(cy - side / 2)
-    x2, y2 = x1 + side, y1 + side
+    # Oversized crop so rotation never clips the palm (diagonal = side√2)
+    large = int(side * math.sqrt(2)) + 4
+    x1, y1 = int(cx - large / 2), int(cy - large / 2)
+    x2, y2 = x1 + large, y1 + large
 
-    crop = np.zeros((side, side), dtype=np.uint8)
+    crop = np.zeros((large, large), dtype=np.uint8)
     sx1, sy1 = max(0, x1), max(0, y1)
     sx2, sy2 = min(W, x2), min(H, y2)
     crop[sy1 - y1 : sy1 - y1 + (sy2 - sy1),
          sx1 - x1 : sx1 - x1 + (sx2 - sx1)] = raw[sy1:sy2, sx1:sx2]
 
     img = Image.fromarray(crop)
-    if is_upside_down(kps):
-        img = img.rotate(180)
+    img = img.rotate(canonical_angle(kps), resample=Image.BICUBIC, expand=False)
 
+    # Centre-crop back to side × side
+    m = (large - side) // 2
+    img = img.crop((m, m, m + side, m + side))
     img = img.resize((128, 128), Image.LANCZOS)
-    arr = np.array(img, dtype=np.float32) / 255.0
 
+    arr = np.array(img, dtype=np.float32) / 255.0
     mask = arr > 0
     if mask.sum() > 1:
-        m = arr[mask].mean()
-        s = arr[mask].std()
-        arr[mask] = (arr[mask] - m) / (s + 1e-6)
+        mu, s = arr[mask].mean(), arr[mask].std()
+        arr[mask] = (arr[mask] - mu) / (s + 1e-6)
 
     return arr[np.newaxis, np.newaxis, :, :]
 
